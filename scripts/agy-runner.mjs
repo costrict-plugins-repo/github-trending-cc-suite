@@ -1,0 +1,691 @@
+#!/usr/bin/env node
+// agy-runner.mjs — Run Antigravity CLI (`agy`) tasks in foreground or background
+// with job tracking. Mirrors codex-runner.mjs so /cc-suite:status, /result and
+// /cancel work identically across both backends.
+//
+// Usage:
+//   node agy-runner.mjs --kind <kind> --model <model> --sandbox <sandbox> \
+//     [--resume <conversationId>] [--timeout-ms <ms>] [--mode <mode>] \
+//     [--add-dir <dir>]... [--background] [--session-id <id>] [--summary <text>] \
+//     -- <prompt>
+//
+// ─── How this differs from codex-runner, and why ─────────────────────────────
+//
+// `agy` is a thinner CLI than `codex exec`. Three capabilities the Codex runner
+// leans on do not exist, and each forces a workaround:
+//
+//   1. No `--json` event stream. Codex emits JSONL we tail as a heartbeat and
+//      mine for the thread id. `agy -p` emits only the final prose answer on
+//      stdout. So stdout IS the result — we accumulate it rather than reading a
+//      side-channel file.
+//
+//   2. No `-o <file>` clean-answer channel. Same consequence as (1): rawOutput
+//      is the captured stdout, trimmed.
+//
+//   3. No printed conversation id. Codex hands back `thread_id`; agy prints
+//      nothing. But it does persist each conversation to
+//      ~/.gemini/antigravity-cli/conversations/<uuid>.db, so we snapshot that
+//      directory before the run and diff it after. See captureConversationId().
+//      This is best-effort and inherently racy — two agy runs finishing
+//      concurrently can each observe the other's new file. When the diff is
+//      ambiguous we record null rather than guess wrong, which costs a resume
+//      but never resumes the WRONG conversation.
+//
+// `agy` also has no reasoning-effort flag: effort is encoded in the model name
+// ("Gemini 3.1 Pro (High)"). --effort is accepted and ignored, with a log line.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+
+import {
+  claimJob,
+  generateJobId,
+  upsertJob,
+  writeJobFile,
+  createJobLogFile,
+} from "./lib/state.mjs";
+import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import {
+  installChildSignalForwarding,
+  readProcessStartTime,
+  terminateProcessTree,
+  waitForExit,
+} from "./lib/process.mjs";
+import { withDelegationBoundary } from "./lib/delegation-boundary.mjs";
+
+const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes — matches codex-runner
+const HEARTBEAT_MS = 30 * 1000;
+const SIGKILL_GRACE_MS = 5 * 1000;
+
+// Job id this process has registered but not yet finalized (or handed off to a
+// detached worker). main()'s rejection handler marks it failed so a crash can
+// never leave a foreground job recorded as running forever.
+let activeJobId = null;
+
+// Where agy persists conversations. Overridable for tests.
+const CONVERSATIONS_DIR =
+  process.env.AGY_CONVERSATIONS_DIR ||
+  path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations");
+
+// A value-taking flag must be followed by a real value. "" is the background
+// argv convention for "unset" and keeps its historical skip-the-flag behavior;
+// another option in value position used to be consumed as the value (e.g.
+// `--model --sandbox read-only` set model to "--sandbox") and now fails loudly.
+function flagValue(value, flag) {
+  if (value.startsWith("--")) {
+    process.stderr.write(`Error: ${flag} requires a value, got '${value}'\n`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const KNOWN_FLAGS = new Set([
+  "--kind", "--model", "--effort", "--sandbox", "--mode", "--add-dir",
+  "--resume", "--timeout-ms", "--background", "--session-id", "--summary",
+]);
+
+const VALID_SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
+const VALID_MODES = new Set(["accept-edits", "plan"]);
+
+function parseArgs(argv) {
+  const args = {
+    kind: "agy",
+    model: null,
+    effort: null,      // accepted for CLI parity; agy has no effort flag
+    sandbox: "read-only",
+    mode: null,        // agy --mode: accept-edits | plan
+    addDirs: [],
+    resume: null,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    background: false,
+    sessionId: null,
+    summary: null,
+    prompt: null,
+  };
+
+  // Every token before `--` must be a known flag (or a flag value): unknown
+  // options, stray positionals, missing flag values, and malformed values all
+  // fail loudly pre-spawn instead of being silently dropped.
+  let i = 2;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === "--") {
+      args.prompt = argv.slice(i + 1).join(" ");
+      break;
+    }
+    if (arg === "--background") {
+      args.background = true;
+      i += 1;
+      continue;
+    }
+    if (!KNOWN_FLAGS.has(arg)) {
+      process.stderr.write(
+        arg.startsWith("--")
+          ? `Error: unknown option '${arg}'\n`
+          : `Error: unexpected argument '${arg}' — the prompt must follow '--'\n`
+      );
+      process.exit(1);
+    }
+    if (i + 1 >= argv.length) {
+      process.stderr.write(`Error: ${arg} requires a value\n`);
+      process.exit(1);
+    }
+    const raw = argv[i + 1];
+    i += 2;
+    if (raw === "") continue; // background "" placeholder — flag stays unset
+    const value = flagValue(raw, arg);
+    switch (arg) {
+      case "--kind": args.kind = value; break;
+      case "--model": args.model = value; break;
+      case "--effort": args.effort = value; break;
+      case "--sandbox": args.sandbox = value; break;
+      case "--mode": args.mode = value; break;
+      case "--add-dir": args.addDirs.push(value); break;
+      case "--resume": args.resume = value; break;
+      case "--session-id": args.sessionId = value; break;
+      case "--summary": args.summary = value; break;
+      case "--timeout-ms": {
+        const n = Number(value);
+        // Node timers cap at 2^31-1 ms; larger values wrap to ~1ms and fire
+        // an immediate false timeout.
+        if (!Number.isInteger(n) || n <= 0 || n > 2147483647) {
+          process.stderr.write(`Error: --timeout-ms requires a positive integer of milliseconds (max 2147483647), got '${value}'\n`);
+          process.exit(1);
+        }
+        args.timeoutMs = n;
+        break;
+      }
+    }
+  }
+
+  return args;
+}
+
+function appendLog(logFile, message) {
+  const timestamp = new Date().toISOString();
+  fs.appendFileSync(logFile, `[${timestamp}] ${message}\n`, "utf8");
+}
+
+// Snapshot the conversation .db filenames so a post-run diff reveals the id of
+// the conversation this call created. Returns a Set of uuid strings.
+function snapshotConversations() {
+  try {
+    return new Set(
+      fs.readdirSync(CONVERSATIONS_DIR)
+        .filter((f) => f.endsWith(".db"))
+        .map((f) => f.slice(0, -3))
+    );
+  } catch {
+    return new Set(); // dir may not exist before agy's first run
+  }
+}
+
+// Diff against the pre-run snapshot. Exactly one new id → that's ours. Zero or
+// more than one → ambiguous (concurrent agy runs); return null rather than
+// attach the wrong conversation to this job.
+function captureConversationId(before, logFile) {
+  const after = snapshotConversations();
+  const fresh = [...after].filter((id) => !before.has(id));
+  if (fresh.length === 1) return fresh[0];
+  if (fresh.length === 0) {
+    appendLog(logFile, "Conversation id: none created (agy may have reused a conversation)");
+  } else {
+    appendLog(logFile, `Conversation id: ambiguous — ${fresh.length} new conversations appeared concurrently; not guessing`);
+  }
+  return null;
+}
+
+// Convert ms → a Go duration string, which is what --print-timeout wants.
+function goDuration(ms) {
+  return `${Math.max(1, Math.round(ms / 1000))}s`;
+}
+
+// Build the `agy` argv.
+//
+// Sandbox mapping (cc-suite vocabulary → agy flags). agy's --sandbox is a
+// boolean ("terminal restrictions enabled"), not a level, so the three cc-suite
+// levels collapse onto two agy switches:
+//
+//   read-only          → --sandbox                (restricted; no auto-approve)
+//   workspace-write    → --mode accept-edits --dangerously-skip-permissions
+//   danger-full-access → --dangerously-skip-permissions
+//
+// Anything that writes needs --dangerously-skip-permissions: headless `-p` mode
+// has no TTY to answer a permission prompt, so without it the run would block
+// until the deadline and be killed.
+//
+// read-only deliberately does NOT get --dangerously-skip-permissions, even
+// though adding it would make shell tools work in that lane (#9). agy documents
+// the flag as "auto-approve all tool permission requests" while --sandbox is
+// only "terminal restrictions" -- so unless the sandbox independently blocks
+// file writes, pairing them would quietly grant write access inside the lane
+// every review and audit path relies on being read-only. That is a boundary
+// change, so it needs evidence rather than inference. The decisive check: run
+// `agy --sandbox --dangerously-skip-permissions -p "<edit a file>"` and see
+// whether the file changes. If the sandbox does block the write, pairing them
+// is correct and this comment should go. Until then the cost of being wrong is
+// one-directional, and the empty-output guard in executeAgy makes the denial
+// loud instead of silent.
+function buildAgyArgs(args) {
+  const agyArgs = [];
+
+  if (args.resume) agyArgs.push("--conversation", args.resume);
+  if (args.model) agyArgs.push("--model", args.model);
+
+  if (args.sandbox === "read-only") {
+    agyArgs.push("--sandbox");
+  } else if (args.sandbox === "workspace-write") {
+    agyArgs.push("--mode", args.mode || "accept-edits");
+    agyArgs.push("--dangerously-skip-permissions");
+  } else if (args.sandbox === "danger-full-access") {
+    agyArgs.push("--dangerously-skip-permissions");
+  }
+
+  // An explicit --mode overrides the sandbox-derived default.
+  if (args.mode && args.sandbox !== "workspace-write") {
+    agyArgs.push("--mode", args.mode);
+  }
+
+  for (const dir of args.addDirs) agyArgs.push("--add-dir", dir);
+
+  // Let agy enforce the same deadline we do. Ours (SIGTERM) is the backstop for
+  // the case where agy ignores its own timeout.
+  agyArgs.push("--print-timeout", goDuration(args.timeoutMs));
+
+  // Antigravity reads the shared .agents/skills tree, which includes cc-suite's
+  // own skills for delegating to Claude Code. Its skill schema has no
+  // allow_implicit_invocation switch, so the prompt is the only place the
+  // hand-back can be refused. See lib/delegation-boundary.mjs.
+  // In read-only the runner passes --sandbox WITHOUT
+  // --dangerously-skip-permissions, so any shell tool the delegate reaches for
+  // is auto-denied by headless mode and the run returns nothing (#9). Telling it
+  // up front to prefer file reads avoids spending the whole deadline discovering
+  // that. This is guidance, not enforcement -- the denial is still what stops a
+  // command, and the empty-output guard in executeAgy still reports it.
+  const readOnlyNote =
+    args.sandbox === "read-only"
+      ? "Execution context: a headless, read-only session with no interactive " +
+        "terminal. Shell and terminal commands are auto-denied and will return " +
+        "nothing, so do not run them (no `git diff`, `ls`, etc.). Use your " +
+        "file-reading tools instead, and work from the context provided.\n\n"
+      : "";
+
+  agyArgs.push("-p", readOnlyNote + withDelegationBoundary(args.prompt));
+
+  return agyArgs;
+}
+
+// Run agy asynchronously: accumulate stdout (which IS the answer), heartbeat
+// into the job log, and enforce a hard deadline by killing the child.
+// Resolves with { status, rawOutput, conversationId, errorMessage }.
+function executeAgy(cwd, args, logFile) {
+  return new Promise((resolve) => {
+    const agyArgs = buildAgyArgs(args);
+    const before = args.resume ? null : snapshotConversations();
+
+    appendLog(logFile, `Exec: agy ${agyArgs.slice(0, -1).join(" ")} <prompt>`);
+    appendLog(
+      logFile,
+      `Model: ${args.model || "(default)"}, Sandbox: ${args.sandbox}${args.resume ? ` (resuming ${args.resume})` : ""}`
+    );
+    if (args.effort) {
+      appendLog(logFile, `Effort: '${args.effort}' ignored — agy encodes effort in the model name (e.g. "Gemini 3.1 Pro (High)")`);
+    }
+    appendLog(logFile, `Deadline: ${Math.round(args.timeoutMs / 1000)}s`);
+
+    const startedAt = Date.now();
+    let stdoutBuf = "";
+    let stderrTail = "";
+    let settled = false;
+    let timedOut = false;
+
+    // stdio[0] = "ignore" attaches /dev/null to fd 0. agy's TUI layer
+    // (bubbletea) opens /dev/tty and dies without one; `-p` avoids the TUI, but
+    // an inherited stdin can still stall the child in hook/background contexts.
+    // Do not change to "pipe" or "inherit" without preserving /dev/null on stdin.
+    // detached:true makes the child a process-group leader (POSIX), so the
+    // deadline can terminate the whole group — helpers agy spawns included —
+    // instead of only the direct child.
+    const child = spawn("agy", agyArgs, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+      detached: true,
+    });
+    const releaseSignals = installChildSignalForwarding(child);
+
+    let killTimer = null;
+
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      clearInterval(heartbeat);
+      clearTimeout(deadline);
+      if (killTimer) clearTimeout(killTimer);
+      releaseSignals();
+      resolve(result);
+    }
+
+
+    // Terminate the child before settling on a failure path. Synchronous and
+    // bounded on purpose: arming an escalation timer here would be cancelled by
+    // finish(), which clears every timer, leaving a SIGTERM-resistant child
+    // alive as a detached orphan.
+    function killChildNow() {
+      try { terminateProcessTree(child.pid, { signal: "SIGTERM" }); } catch {}
+      if (waitForExit([child.pid], 1000).size > 0) {
+        try { terminateProcessTree(child.pid, { signal: "SIGKILL" }); } catch {}
+      }
+    }
+
+    // Timer and stream callbacks run outside the Promise chain: a synchronous
+    // write failure (full disk, deleted log dir) would otherwise become an
+    // uncaught exception that kills the runner and strands the job as running.
+    function guarded(fn) {
+      return (...callbackArgs) => {
+        try {
+          fn(...callbackArgs);
+        } catch (error) {
+          killChildNow();
+          finish({
+            status: "failed",
+            errorMessage: `Runner callback failed: ${error?.message || error}`,
+            conversationId: null,
+            rawOutput: stdoutBuf.trim(),
+          });
+        }
+      };
+    }
+
+    const heartbeat = setInterval(
+      guarded(() => {
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        appendLog(logFile, `…still running (${elapsed}s elapsed)`);
+      }),
+      HEARTBEAT_MS
+    );
+
+    const deadline = setTimeout(
+      guarded(() => {
+        timedOut = true;
+        appendLog(logFile, `Deadline exceeded (${Math.round(args.timeoutMs / 1000)}s) — terminating`);
+        terminateProcessTree(child.pid, { signal: "SIGTERM" });
+        killTimer = setTimeout(() => {
+          if (!settled) terminateProcessTree(child.pid, { signal: "SIGKILL" });
+        }, SIGKILL_GRACE_MS);
+        killTimer.unref?.();
+      }),
+      args.timeoutMs
+    );
+
+    // Unlike codex, stdout is not an event stream — it is the answer. Buffer it
+    // whole and mirror it into the job log for observability.
+    child.stdout.on(
+      "data",
+      guarded((chunk) => {
+        const text = chunk.toString();
+        stdoutBuf += text;
+        fs.appendFileSync(logFile, text, "utf8");
+      })
+    );
+
+    child.stderr.on(
+      "data",
+      guarded((chunk) => {
+        const text = chunk.toString();
+        stderrTail = (stderrTail + text).slice(-2000);
+        fs.appendFileSync(logFile, text, "utf8");
+      })
+    );
+
+    child.on("error", (err) => {
+      const hint =
+        err.code === "ENOENT"
+          ? "agy not found on PATH — install Antigravity CLI: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+          : err.message;
+      try {
+        appendLog(logFile, `Spawn error: ${hint}`);
+      } catch {}
+      finish({ status: "failed", errorMessage: hint, conversationId: null, rawOutput: "" });
+    });
+
+    child.on("close", guarded((code, signal) => {
+      const rawOutput = stdoutBuf.trim();
+      const conversationId = args.resume
+        ? args.resume
+        : captureConversationId(before, logFile);
+
+      if (timedOut) {
+        finish({
+          status: "stalled",
+          errorMessage: `Timed out after ${Math.round(args.timeoutMs / 1000)}s`,
+          conversationId,
+          rawOutput,
+        });
+        return;
+      }
+      if (code !== 0) {
+        const stderrMsg = stderrTail.trim();
+        finish({
+          status: "failed",
+          errorMessage:
+            code === null
+              ? `signal ${signal}${stderrMsg ? `: ${stderrMsg}` : ""}`
+              : stderrMsg || `exit ${code}`,
+          conversationId,
+          rawOutput,
+        });
+        return;
+      }
+      // agy exits 0 on its own internal timeout, printing "Error: timeout
+      // waiting for response" to stdout. Treat that as stalled, not success.
+      if (/^Error: timeout waiting for response/m.test(rawOutput)) {
+        finish({
+          status: "stalled",
+          errorMessage: "agy reported: timeout waiting for response",
+          conversationId,
+          rawOutput,
+        });
+        return;
+      }
+      // Exit 0 with nothing on stdout is never a usable answer from this lane,
+      // and it is the shape agy takes when headless mode auto-denies a tool: the
+      // model asked for the `command` permission, `-p` has no TTY to prompt on,
+      // jetski denied it and agy still exited 0. Reporting that as `completed`
+      // hands the caller an empty string that looks like a successful review
+      // (#9) -- a silent failure wearing a green badge. Fail loudly instead, and
+      // name the remedy, because the caller cannot see agy's stderr.
+      if (!rawOutput) {
+        const denied = /required the "command" permission|no output produced|dangerously-skip-permissions/i.test(
+          stderrTail,
+        );
+        finish({
+          status: "failed",
+          errorMessage: denied
+            ? "agy produced no output: a tool required the \"command\" permission, " +
+              "which headless mode cannot prompt for, so it was auto-denied. Either add an " +
+              "allow-rule under permissions.allow in agy's settings.json, re-run with " +
+              "--sandbox workspace-write, or tell the delegate to read files instead of " +
+              "running shell commands."
+            : "agy exited 0 but produced no output" +
+              (stderrTail.trim() ? `: ${stderrTail.trim()}` : "."),
+          conversationId,
+          rawOutput,
+        });
+        return;
+      }
+      if (conversationId) appendLog(logFile, `Conversation: ${conversationId}`);
+      appendLog(logFile, "Completed successfully");
+      finish({ status: "completed", conversationId, rawOutput });
+    }));
+  });
+}
+
+async function runForeground(cwd, args) {
+  const jobId = generateJobId(args.kind);
+  activeJobId = jobId;
+  const logFile = createJobLogFile(cwd, jobId);
+  const sessionId = args.sessionId || process.env.CODEX_TOOLKIT_SESSION_ID || null;
+  const deadlineAt = new Date(Date.now() + args.timeoutMs).toISOString();
+
+  upsertJob(cwd, {
+    id: jobId,
+    kind: args.kind,
+    status: "running",
+    summary: args.summary || `${args.kind} task`,
+    sessionId,
+    pid: process.pid,
+    pidStartedAt: readProcessStartTime(process.pid),
+    startedAt: new Date().toISOString(),
+    deadlineAt,
+    logFile,
+  });
+
+  appendLog(logFile, `Starting ${args.kind} task (foreground, backend=agy)`);
+
+  const result = await executeAgy(cwd, args, logFile);
+
+  // threadId is the shared job-record field name across backends; for agy it
+  // carries the conversation uuid so /cc-suite:continue works uniformly.
+  upsertJob(cwd, {
+    id: jobId,
+    status: result.status,
+    threadId: result.conversationId || null,
+    completedAt: new Date().toISOString(),
+    ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+  });
+  writeJobFile(cwd, jobId, {
+    rawOutput: result.rawOutput || "",
+    threadId: result.conversationId || null,
+    ...(result.errorMessage ? { error: result.errorMessage } : {}),
+  });
+  activeJobId = null; // job state and result are fully persisted
+
+  const output = {
+    jobId,
+    status: result.status,
+    threadId: result.conversationId || null,
+    rawOutput: result.rawOutput || "",
+    ...(result.errorMessage ? { error: result.errorMessage } : {}),
+  };
+  process.stdout.write(JSON.stringify(output) + "\n");
+  if (result.status !== "completed") process.exitCode = 1;
+}
+
+function runBackground(cwd, args) {
+  const jobId = generateJobId(args.kind);
+  activeJobId = jobId;
+  const logFile = createJobLogFile(cwd, jobId);
+  const sessionId = args.sessionId || process.env.CODEX_TOOLKIT_SESSION_ID || null;
+
+  upsertJob(cwd, {
+    id: jobId,
+    kind: args.kind,
+    status: "queued",
+    summary: args.summary || `${args.kind} task`,
+    sessionId,
+    logFile,
+  });
+
+  appendLog(logFile, `Queued ${args.kind} task (background, backend=agy)`);
+
+  const childArgv = [
+    fileURLToPath(import.meta.url),
+    "--kind", args.kind,
+    "--model", args.model || "",
+    "--sandbox", args.sandbox,
+    "--timeout-ms", String(args.timeoutMs),
+    "--session-id", sessionId || "",
+    "--summary", args.summary || "",
+  ];
+  if (args.mode) childArgv.push("--mode", args.mode);
+  for (const dir of args.addDirs) childArgv.push("--add-dir", dir);
+  if (args.resume) childArgv.push("--resume", args.resume);
+  childArgv.push("--", args.prompt);
+
+  const child = spawn(process.execPath, childArgv, {
+    cwd,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      CODEX_TOOLKIT_BACKGROUND_JOB_ID: jobId,
+    },
+  });
+
+  // The worker records the running transition itself (with its own pid), like
+  // the other runners: writing `running` here would race a fast worker and
+  // could overwrite its terminal state.
+  child.on("error", (err) => {
+    appendLog(logFile, `Background spawn error: ${err.message}`);
+    upsertJob(cwd, {
+      id: jobId,
+      status: "failed",
+      errorMessage: `Failed to start background worker: ${err.message}`,
+      completedAt: new Date().toISOString(),
+    });
+  });
+
+  child.unref();
+  activeJobId = null; // the job now belongs to the detached worker
+
+  const output = { jobId, status: "queued", message: `Job ${jobId} started in background.` };
+  process.stdout.write(JSON.stringify(output) + "\n");
+}
+
+async function runBackgroundWorker(cwd, args, jobId) {
+  const logFile = createJobLogFile(cwd, jobId);
+  // Claim the queued job atomically — see codex-runner for the rationale.
+  const claimed = claimJob(cwd, jobId, {
+    status: "running",
+    pid: process.pid,
+    pidStartedAt: readProcessStartTime(process.pid),
+    startedAt: new Date().toISOString(),
+    deadlineAt: new Date(Date.now() + args.timeoutMs).toISOString(),
+  });
+  if (!claimed) {
+    appendLog(logFile, "Background worker exiting — job was cancelled before startup");
+    return;
+  }
+  appendLog(logFile, "Background worker started (backend=agy)");
+
+  const result = await executeAgy(cwd, args, logFile);
+
+  upsertJob(cwd, {
+    id: jobId,
+    status: result.status,
+    threadId: result.conversationId || null,
+    completedAt: new Date().toISOString(),
+    ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+  });
+  writeJobFile(cwd, jobId, {
+    rawOutput: result.rawOutput || "",
+    threadId: result.conversationId || null,
+    ...(result.errorMessage ? { error: result.errorMessage } : {}),
+  });
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+
+  if (!args.prompt) {
+    process.stderr.write("Error: no prompt provided. Use -- <prompt>\n");
+    process.exit(1);
+  }
+  // An invalid sandbox must fail loudly: buildAgyArgs would otherwise emit
+  // neither --sandbox nor a permission flag, silently dropping the requested
+  // isolation.
+  if (!VALID_SANDBOXES.has(args.sandbox)) {
+    process.stderr.write(`Error: invalid --sandbox '${args.sandbox}' (expected read-only, workspace-write, or danger-full-access)\n`);
+    process.exit(1);
+  }
+  if (args.mode && !VALID_MODES.has(args.mode)) {
+    process.stderr.write(`Error: invalid --mode '${args.mode}' (expected accept-edits or plan)\n`);
+    process.exit(1);
+  }
+
+  const cwd = resolveWorkspaceRoot(process.cwd());
+
+  const backgroundJobId = process.env.CODEX_TOOLKIT_BACKGROUND_JOB_ID;
+  if (backgroundJobId) {
+    await runBackgroundWorker(cwd, args, backgroundJobId);
+    return;
+  }
+
+  if (args.background) {
+    runBackground(cwd, args);
+  } else {
+    await runForeground(cwd, args);
+  }
+}
+
+main().catch((error) => {
+  const message = error?.message || String(error);
+  // A worker crash finalizes the job named by its environment; a foreground or
+  // spawn-parent crash finalizes whatever job this process registered but had
+  // not yet brought to a terminal state.
+  const jobId = process.env.CODEX_TOOLKIT_BACKGROUND_JOB_ID || activeJobId || null;
+  if (jobId) {
+    try {
+      upsertJob(resolveWorkspaceRoot(process.cwd()), {
+        id: jobId,
+        status: "failed",
+        errorMessage: message,
+        completedAt: new Date().toISOString(),
+      });
+    } catch {
+      // State unreachable — the structured output below is the only signal.
+    }
+  }
+  process.stdout.write(JSON.stringify({
+    jobId,
+    status: "failed",
+    error: message,
+  }) + "\n");
+  process.stderr.write(`Error: ${message}\n`);
+  process.exitCode = 1;
+});
